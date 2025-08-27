@@ -6,7 +6,7 @@ Adds:
 - Larger default timeouts (INIT_TIMEOUT=60, REQ_TIMEOUT=20)
 - Extensive logging: outgoing JSON-RPC messages, incoming messages, server stderr
 - Sets RUST_LOG=debug in server env to surface initialization logs
-- Prints PID and writes logs to audit/automated/logs/
+- Writes logs to audit/automated/logs/
 
 Use: STEEL_LSP_CMD=/path/to/steel-language-server python3 run_audit.py
 """
@@ -19,7 +19,6 @@ import subprocess
 import threading
 import time
 import re
-import os
 import select
 from pathlib import Path
 from typing import Union
@@ -50,6 +49,24 @@ INCOMING_LOG = LOG_DIR / 'incoming.jsonl'
 STDERR_LOG = LOG_DIR / 'server.stderr.log'
 GENERAL_LOG = LOG_DIR / 'run.log'
 
+# Redirect stdout to the general log to avoid console noise in CI
+class _StdoutLogger:
+    def write(self, s):
+        try:
+            if not s:
+                return
+            with GENERAL_LOG.open('a', encoding='utf-8') as f:
+                f.write(s)
+        except Exception:
+            pass
+    def flush(self):
+        try:
+            pass
+        except Exception:
+            pass
+
+sys.stdout = _StdoutLogger()
+
 # Helpers to append logs
 def _append_jsonl(path: Path, obj):
     try:
@@ -57,7 +74,7 @@ def _append_jsonl(path: Path, obj):
             f.write(json.dumps(obj, ensure_ascii=False))
             f.write('\n')
     except Exception as e:
-        print('Failed to write log', path, e)
+        _append_text(GENERAL_LOG, f'Failed to write jsonl {path}: {e}\n')
 
 def _append_text(path: Path, text: str):
     try:
@@ -72,7 +89,6 @@ class JSONRPCError(Exception):
 class LSPProcess:
     def __init__(self, cmd: Union[str, list]):
         self.cmd = cmd
-        print('Launching LSP with command:', cmd)
         _append_text(GENERAL_LOG, f'Launching LSP with command: {cmd}\n')
 
         # Prepare environment for the server: enable debug logging to capture initialization details
@@ -90,7 +106,6 @@ class LSPProcess:
         if self.proc.stdin is None or self.proc.stdout is None:
             raise RuntimeError('Failed to start LSP process with stdio pipes')
 
-        print(f'LSP PID: {self.proc.pid}')
         _append_text(GENERAL_LOG, f'LSP PID: {self.proc.pid}\n')
 
         self._id = 0
@@ -118,33 +133,54 @@ class LSPProcess:
                     s = line.decode('utf-8', errors='replace')
                 except Exception:
                     s = str(line)
-                print('[LSP STDERR]', s.rstrip())
                 _append_text(STDERR_LOG, s)
         except Exception as e:
             _append_text(GENERAL_LOG, f'stderr reader error: {e}\n')
 
     def _reader(self):
+        _append_text(GENERAL_LOG, '[reader] started\n')
         buf = b''
+        # try to use file descriptor for more reliable select/os.read
+        fd = None
+        try:
+            fd = self.proc.stdout.fileno()
+        except Exception:
+            fd = None
         while True:
             try:
                 if self.proc.stdout is None:
+                    _append_text(GENERAL_LOG, '[reader] proc.stdout is None, exiting\n')
                     break
-                # use select to wait for data without blocking indefinitely
-                try:
-                    rlist, _, _ = select.select([self.proc.stdout], [], [], 0.1)
-                except Exception:
-                    # fallback if select on file object fails
-                    rlist = [self.proc.stdout]
-                if not rlist:
-                    if self.proc.poll() is not None:
-                        break
-                    continue
-                chunk = self.proc.stdout.read(4096)
+                if fd is not None:
+                    # wait up to 0.1s for data
+                    rlist, _, _ = select.select([fd], [], [], 0.1)
+                    if not rlist:
+                        if self.proc.poll() is not None:
+                            _append_text(GENERAL_LOG, '[reader] process exited while waiting\n')
+                            break
+                        continue
+                    try:
+                        chunk = os.read(fd, 4096)
+                    except Exception:
+                        chunk = self.proc.stdout.read(4096)
+                else:
+                    # fallback to selecting on the file object
+                    try:
+                        rlist, _, _ = select.select([self.proc.stdout], [], [], 0.1)
+                    except Exception:
+                        rlist = [self.proc.stdout]
+                    if not rlist:
+                        if self.proc.poll() is not None:
+                            _append_text(GENERAL_LOG, '[reader] process exited while waiting (fallback)\n')
+                            break
+                        continue
+                    chunk = self.proc.stdout.read(4096)
             except Exception as e:
                 _append_text(GENERAL_LOG, f'reader exception: {e}\n')
                 break
             if not chunk:
                 if self.proc.poll() is not None:
+                    _append_text(GENERAL_LOG, '[reader] EOF and process exited\n')
                     break
                 time.sleep(0.01)
                 continue
@@ -249,12 +285,10 @@ class LSPProcess:
 
 
 def build_ffi():
-    print('Building FFI crate...')
     _append_text(GENERAL_LOG, 'Building FFI crate...\n')
     r = subprocess.run(['cargo', 'build', '--release'], cwd=FFI_DIR)
     if r.returncode != 0:
         raise RuntimeError('FFI build failed')
-    print('FFI build complete')
     _append_text(GENERAL_LOG, 'FFI build complete\n')
 
 
@@ -321,10 +355,8 @@ def run_tests():
         _append_text(GENERAL_LOG, f'sent initialize id={id0}\n')
         try:
             res = lsp.wait_response(id0, timeout=INIT_TIMEOUT)
-            print('Initialize response:', res.get('result') if res else res)
             _append_jsonl(INCOMING_LOG, {'initialize_result': res})
         except Exception as e:
-            print('Initialize failed:', e)
             _append_text(GENERAL_LOG, f'Initialize failed: {e}\n')
             # Dump partial notifications for debugging
             notifs = lsp.collect_notifications()
@@ -348,18 +380,12 @@ def run_tests():
         # Wait for diagnostics
         diag = wait_for_notification(lsp, lambda n: isinstance(n, dict) and n.get('method') == 'textDocument/publishDiagnostics' and n.get('params', {}).get('uri') == uri, timeout=5.0)
         if diag:
-            print('Found diagnostics notification for infix.stl')
             _append_jsonl(INCOMING_LOG, {'diagnostics': diag})
-        else:
-            print('No diagnostics notification found (yet) for infix.stl')
-
         # Hover over the '*' occurrence
         target = '(infix 5 * 10)'
         idx = text.find(target)
         hover_res = None
-        if idx == -1:
-            print('Could not find target example in infix.stl')
-        else:
+        if idx != -1:
             before = text[:idx]
             line = before.count('\n')
             col = len(before.split('\n')[-1]) + target.index('*')
@@ -370,16 +396,14 @@ def run_tests():
             })
             try:
                 hover_res = lsp.wait_response(hover_id, timeout=REQ_TIMEOUT)
-                print('Hover response for *:', hover_res)
             except Exception as e:
-                print('Hover request timed out or failed:', e)
                 _append_text(GENERAL_LOG, f'Hover request error: {e}\n')
 
         # Collect diagnostics count
         time.sleep(0.2)
         notifs = lsp.collect_notifications()
         diag_notifications = [n for n in notifs if n.get('method') == 'textDocument/publishDiagnostics']
-        print('Diagnostics notifications count (total seen):', len(diag_notifications))
+        _append_text(GENERAL_LOG, f'Diagnostics notifications count (total seen): {len(diag_notifications)}\n')
 
         # Open ffi main
         text2 = FFI_MAIN.read_text()
@@ -397,9 +421,7 @@ def run_tests():
         hover_res2 = None
         goto_res = None
         idx2 = text2.find('procesar_struct')
-        if idx2 == -1:
-            print('Could not find procesar_struct in main.stl')
-        else:
+        if idx2 != -1:
             before2 = text2[:idx2]
             line2 = before2.count('\n')
             col2 = len(before2.split('\n')[-1])
@@ -407,64 +429,60 @@ def run_tests():
             hover_id2 = lsp.send('textDocument/hover', {'textDocument': {'uri': uri2}, 'position': pos2})
             try:
                 hover_res2 = lsp.wait_response(hover_id2, timeout=REQ_TIMEOUT)
-                print('Hover response for procesar_struct:', hover_res2)
             except Exception as e:
-                print('Hover for procesar_struct timed out or failed:', e)
                 _append_text(GENERAL_LOG, f'Hover2 error: {e}\n')
 
             goto_id = lsp.send('textDocument/definition', {'textDocument': {'uri': uri2}, 'position': pos2})
             try:
                 goto_res = lsp.wait_response(goto_id, timeout=REQ_TIMEOUT)
-                print('Go-to-definition result for procesar_struct:', goto_res)
             except Exception as e:
-                print('Go-to-definition timed out or failed:', e)
                 _append_text(GENERAL_LOG, f'Goto error: {e}\n')
 
         # Evaluate expectations
         passed = True
         if EXPECT_HOVER_FOR_MACRO:
             if not hover_res or not hover_res.get('result'):
-                print('FAIL: Expected hover content for macro symbol but got none')
+                _append_text(GENERAL_LOG, 'FAIL: Expected hover content for macro symbol but got none\n')
                 passed = False
         else:
             if hover_res and hover_res.get('result'):
-                print('WARN: Hover returned content for macro symbol (unexpected)')
+                _append_text(GENERAL_LOG, 'WARN: Hover returned content for macro symbol (unexpected)\n')
 
         if len(diag_notifications) < EXPECT_MIN_DIAGNOSTICS:
-            print(f'FAIL: Expected at least {EXPECT_MIN_DIAGNOSTICS} diagnostics notifications, saw {len(diag_notifications)}')
+            _append_text(GENERAL_LOG, f'FAIL: Expected at least {EXPECT_MIN_DIAGNOSTICS} diagnostics notifications, saw {len(diag_notifications)}\n')
             passed = False
         else:
-            print(f'OK: Diagnostics notifications >= {EXPECT_MIN_DIAGNOSTICS}')
+            _append_text(GENERAL_LOG, f'OK: Diagnostics notifications >= {EXPECT_MIN_DIAGNOSTICS}\n')
 
         if EXPECT_HOVER_FOR_FFI:
             if not hover_res2 or not hover_res2.get('result'):
-                print('FAIL: Expected hover for FFI symbol but got none')
+                _append_text(GENERAL_LOG, 'FAIL: Expected hover for FFI symbol but got none\n')
                 passed = False
         else:
             if hover_res2 and hover_res2.get('result'):
-                print('WARN: Hover returned content for FFI symbol (unexpected)')
+                _append_text(GENERAL_LOG, 'WARN: Hover returned content for FFI symbol (unexpected)\n')
 
         if EXPECT_GOTO_FOR_FFI:
             if not goto_res or not goto_res.get('result'):
-                print('FAIL: Expected gotoDefinition for FFI symbol but got none')
+                _append_text(GENERAL_LOG, 'FAIL: Expected gotoDefinition for FFI symbol but got none\n')
                 passed = False
         else:
             if goto_res and goto_res.get('result'):
-                print('WARN: gotoDefinition returned a result for FFI symbol (unexpected)')
+                _append_text(GENERAL_LOG, 'WARN: gotoDefinition returned a result for FFI symbol (unexpected)\n')
 
         if passed:
-            print('\n=== AUDIT RESULT: PASS ===')
+            _append_text(GENERAL_LOG, '\n=== AUDIT RESULT: PASS ===\n')
         else:
-            print('\n=== AUDIT RESULT: FAIL ===')
+            _append_text(GENERAL_LOG, '\n=== AUDIT RESULT: FAIL ===\n')
 
     finally:
         lsp.shutdown()
+
 
 if __name__ == '__main__':
     try:
         run_tests()
     except Exception as e:
-        print('Error running audit:', e)
         _append_text(GENERAL_LOG, f'run_tests exception: {e}\n')
         sys.exit(1)
-    print('Audit run complete')
+    _append_text(GENERAL_LOG, 'Audit run complete\n')
