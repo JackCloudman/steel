@@ -1,0 +1,6 @@
+# Ignore generated artifacts. The CI workflow is responsible for running the
+# harness and archiving the results. The raw evidence should be viewed via
+# the CI run artifacts, not committed to the repository.
+automated/logs/
+automated/results/
+automated/__pycache__/
